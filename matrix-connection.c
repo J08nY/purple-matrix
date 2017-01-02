@@ -17,6 +17,7 @@
  */
 
 #include "matrix-connection.h"
+#include "matrix-e2e.h"
 
 #include <string.h>
 
@@ -184,6 +185,9 @@ static void _login_completed(MatrixConnectionData *conn,
     purple_account_set_string(pc->account, "device_id", 
         matrix_json_object_get_string_member(root_obj, "device_id"));
 
+    if (device_id) {
+        matrix_e2e_get_device_keys(conn, device_id);
+    }
     /* start the sync loop */
     next_batch = purple_account_get_string(pc->account,
             PRPL_ACCOUNT_OPT_NEXT_BATCH, NULL);
