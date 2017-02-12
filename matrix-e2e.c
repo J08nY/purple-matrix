@@ -37,6 +37,13 @@ struct _MatrixE2EData {
     gchar *ed25519_pubkey;
 };
 
+
+static void key_upload_callback(MatrixConnectionData *conn,
+                                gpointer user_data,
+                                struct _JsonNode *json_root,
+                                const char *body,
+                                size_t body_len, const char *content_type);
+
 /* Returns a pointer to a freshly allocated buffer of 'n' bytes of random data.
  * If it fails it returns NULL.
  * TODO: There must be some portable function we can call to do this.
@@ -282,7 +289,111 @@ out:
     return ret;
 }
 
-/* Called back when we've successfully uploaded the device keys */
+/* TODO: Check if we need this every 10mins or so */
+/* See: https://matrix.org/docs/guides/e2e_implementation.html#creating-and-registering-one-time-keys */
+static int send_one_time_keys(MatrixConnectionData *conn, size_t n_keys)
+{
+    PurpleConnection *pc = conn->pc;
+    int ret;
+    size_t random_needed = olm_account_generate_one_time_keys_random_length(conn->e2e->oa, n_keys);
+    void *random_buffer = get_random(random_needed);
+    void *olm_1t_keys_json = NULL;
+    JsonParser *json_parser = NULL;
+    if (!random_buffer) return -1;
+
+    if (olm_account_generate_one_time_keys(conn->e2e->oa, n_keys, random_buffer, random_needed) ==
+        olm_error()) {
+        purple_connection_error_reason(pc,
+                PURPLE_CONNECTION_ERROR_OTHER_ERROR,
+                olm_account_last_error(conn->e2e->oa));
+        ret = -1;
+        goto out;
+    }
+
+    size_t olm_keys_buffer_size = olm_account_one_time_keys_length(conn->e2e->oa);
+    olm_1t_keys_json = g_malloc0(olm_keys_buffer_size+1);
+    if (olm_account_one_time_keys(conn->e2e->oa, olm_1t_keys_json, olm_keys_buffer_size) == olm_error()) {
+        purple_connection_error_reason(pc,
+                PURPLE_CONNECTION_ERROR_OTHER_ERROR,
+                olm_account_last_error(conn->e2e->oa));
+        ret = -1;
+        goto out;
+    }
+
+    /* olm_1t_keys_json has json like:
+     *   {
+     *     curve25519: {
+     *       "keyid1": "base64encodedcurve25519key1",
+     *       "keyid2": "base64encodedcurve25519key2"
+     *     }
+     *   }
+     *   I think in practice this is just curve25519 but I'll avoid hard coding
+     *   We need to produce an object with a set of signed objects each having one key
+     */
+    json_parser = json_parser_new();
+    GError *err = NULL;
+    if (!json_parser_load_from_data(json_parser,
+          olm_1t_keys_json, strlen(olm_1t_keys_json), &err)) {
+        purple_connection_error_reason(pc,
+            PURPLE_CONNECTION_ERROR_OTHER_ERROR,
+            "Failed to parse generated 1-time json");
+        g_error_free(err);
+        ret = -1;
+        goto out;
+    }
+
+    /* The output JSON we're generating */
+    JsonObject *otk_json = json_object_new();
+
+    JsonNode *olm_1tk_root = json_parser_get_root(json_parser);
+    JsonObject *olm_1tk_obj = matrix_json_node_get_object(olm_1tk_root);
+    JsonObjectIter algo_iter;
+    json_object_iter_init(&algo_iter, olm_1tk_obj);
+    const gchar *keys_algo;
+    JsonNode *keys_node;
+    while (json_object_iter_next(&algo_iter, &keys_algo, &keys_node)) {
+        /* We're expecting keys_algo to be "curve25519" and keys_node to be an object
+         * with a set of keys.
+         */
+        JsonObjectIter keys_iter;
+        JsonObject *keys_obj = matrix_json_node_get_object(keys_node);
+        json_object_iter_init(&keys_iter, keys_obj);
+        const gchar *key_id;
+        JsonNode *key_node;
+        while (json_object_iter_next(&keys_iter, &key_id, &key_node)) {
+            const gchar *key_string = matrix_json_node_get_string(key_node);
+
+            JsonObject *signed_key = json_object_new();
+            json_object_set_string_member(signed_key, "key", key_string);
+            ret = matrix_sign_json(conn, signed_key);
+            if (ret) {
+                // TODO - clean up partial key
+                goto out;
+            }
+            GString *signed_key_name = g_string_new(NULL);
+            g_string_printf(signed_key_name, "signed_%s:%s", keys_algo, key_id);
+            gchar *signed_key_name_char = g_string_free(signed_key_name, FALSE);
+            json_object_set_object_member(otk_json, signed_key_name_char, signed_key);
+            g_free(signed_key_name_char);
+        }
+    }
+
+    matrix_api_upload_keys(conn, NULL, otk_json,
+        key_upload_callback,
+        matrix_api_error, matrix_api_bad_response, (void *)1);
+    ret = 0;
+out:
+    g_object_unref(json_parser);
+    g_free(random_buffer);
+    g_free(olm_1t_keys_json);
+
+    return ret;
+}
+
+/* Called back when we've successfully uploaded the device keys
+ * we use 'user_data' = 1 to indicate we did an upload of one time
+ * keys.
+ */
 static void key_upload_callback(MatrixConnectionData *conn,
                                 gpointer user_data,
                                 struct _JsonNode *json_root,
@@ -298,7 +409,14 @@ static void key_upload_callback(MatrixConnectionData *conn,
     JsonObject *top_object = matrix_json_node_get_object(json_root);
     JsonObject *key_counts = matrix_json_object_get_object_member(top_object, "one_time_key_counts");
 
-    fprintf(stderr, "%s: json_root=%p top_object=%p key_counts=%p\n", __func__, json_root, top_object, key_counts);
+    fprintf(stderr, "%s: user_data=%p json_root=%p top_object=%p key_counts=%p\n", __func__, user_data, json_root, top_object, key_counts);
+
+    /* True if it's a response to a key upload */
+    if (user_data) {
+        /* Tell Olm that these one time keys are uploaded */
+        olm_account_mark_keys_as_published(conn->e2e->oa);
+        matrix_store_e2e_account(conn);
+    }
 
     if (key_counts) {
         JsonObjectIter iter;
@@ -320,11 +438,13 @@ static void key_upload_callback(MatrixConnectionData *conn,
     /* TODO: This could be more selective and check for counts of the ones
      * we care about (perhaps we don't need to loop - just ask for those)
      */
+
     need_to_send |= !have_count;
 
     if (need_to_send) {
         // TODO
         fprintf(stderr, "%s: need to send\n",__func__);
+        send_one_time_keys(conn, to_create);
     }
 }
 
