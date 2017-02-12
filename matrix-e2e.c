@@ -187,7 +187,7 @@ static int matrix_store_e2e_account(MatrixConnectionData *conn)
         g_free(pickled_account);
         return -1;
     }
-    fprintf(stderr, "Got a pickled account %s\n", pickled_account);
+    //fprintf(stderr, "Got a pickled account %s\n", pickled_account);
 
     /* Create a JSON string to store in our account data, we include
      * our device and server as sanity checks.
@@ -655,8 +655,6 @@ int matrix_e2e_get_device_keys(MatrixConnectionData *conn, const gchar *device_i
 
     ret = 0;
 
-    // TODO:
-    //   Add one time keys
 out:
     if (json_dev_keys)
          json_object_unref(json_dev_keys);
@@ -664,6 +662,7 @@ out:
 
     if (ret) {
         close_e2e_db(conn);
+        g_free(conn->e2e->curve25519_pubkey);
         g_free(conn->e2e->oa);
         g_free(conn->e2e->device_id);
         g_free(conn->e2e);
@@ -671,3 +670,195 @@ out:
     }
     return ret;
 }
+
+static int handle_m_room_key(PurpleConnection *pc, MatrixConnectionData *conn, JsonObject *mrk)
+{
+    fprintf(stderr, "%s\n", __func__);
+    return 0;
+}
+
+/* Called from decypt_olm after we've decrypted an olm message.
+ */
+static int handle_decrypted_olm(PurpleConnection *pc, MatrixConnectionData *conn,
+                                 const gchar *sender, const gchar *sender_key, gchar *plaintext)
+{
+    JsonParser *json_parser = json_parser_new();
+    GError *err = NULL;
+    int ret = 0;
+
+    fprintf(stderr, "%s: %s\n", __func__, plaintext);
+    if (!json_parser_load_from_data(json_parser, plaintext, strlen(plaintext), &err)) {
+        purple_connection_error_reason(pc,
+                PURPLE_CONNECTION_ERROR_OTHER_ERROR,
+                "Failed to parse decrypted olm JSON");
+        purple_debug_info("matrixprpl",
+                "unable to parse decrypted olm JSON: %s",
+                err->message);
+        g_error_free(err);
+        ret = -1;
+        goto out;
+
+    }
+    JsonNode *pt_node = json_parser_get_root(json_parser);
+    JsonObject *pt_body = matrix_json_node_get_object(pt_node);
+
+    /* The spec says we need to check these actually match */
+    const gchar *pt_sender = matrix_json_object_get_string_member(pt_body, "sender");
+    const gchar *pt_sender_device = matrix_json_object_get_string_member(pt_body, "sender_device");
+    const gchar *pt_recipient = matrix_json_object_get_string_member(pt_body, "recipient");
+    JsonObject *pt_recipient_keys = matrix_json_object_get_object_member(pt_body, "recipient_keys");
+    const gchar *pt_recipient_ed = matrix_json_object_get_string_member(pt_recipient_keys, "ed25519");
+    const gchar *pt_type = matrix_json_object_get_string_member(pt_body, "type");
+
+    if (!pt_sender || !pt_sender_device || !pt_recipient || !pt_recipient_ed || !pt_type) {
+        fprintf(stderr, "%s: Missing field (one of sender/sender_device/recipient/recipient_keys/type\n", __func__);
+        ret = -1;
+        goto out;
+    }
+    if (strcmp(sender, pt_sender)) {
+        fprintf(stderr, "%s: Mismatch on sender '%s' vs '%s'\n", __func__, sender, pt_sender);
+        ret = -1;
+        goto out;
+    }
+    if (strcmp(conn->user_id, pt_recipient)) {
+        fprintf(stderr, "%s: Mismatch on recipient '%s' vs '%s'\n", __func__, conn->user_id, pt_recipient);
+        ret = -1;
+        goto out;
+    }
+    if (strcmp(conn->e2e->ed25519_pubkey, pt_recipient_ed)) {
+        fprintf(stderr, "%s: Mismatch on recipient key '%s' vs '%s' pt_recipient_keys=%p\n", __func__, conn->e2e->ed25519_pubkey, pt_recipient_ed, pt_recipient_keys);
+        ret = -1;
+        goto out;
+    }
+
+    /* TODO: check the device against the keys in use, stash somewhere? */
+    if (!strcmp(pt_type, "m.room_key")) {
+        ret = handle_m_room_key(pc, conn, pt_body);
+    } else {
+        fprintf(stderr, "%s: Got '%s' from '%s'/'%s'\n", __func__, pt_type, pt_sender_device, pt_sender);
+    }
+out:
+    g_object_unref(json_parser);
+    return ret;
+}
+
+/*
+ * See:
+ * https://matrix.org/docs/guides/e2e_implementation.html#m-olm-v1-curve25519-aes-sha2
+ * TODO: All the error paths in this function need to clean up!
+ */
+static void decrypt_olm(PurpleConnection *pc, MatrixConnectionData *conn, JsonObject *cevent,
+                                   JsonObject *cevent_content, gboolean d2d)
+{
+    fprintf(stderr, "%s: It's olm!\n", __func__);
+    const gchar *cevent_sender = matrix_json_object_get_string_member(cevent, "sender");
+
+    const gchar *sender_key = matrix_json_object_get_string_member(cevent_content, "sender_key");
+    JsonObject *cevent_ciphertext = matrix_json_object_get_object_member(cevent_content, "ciphertext");
+    /* TODO: Look up sender_key - I think we need to check this against device list from user? */
+    /* TODO: Look up sender_key/cevent_sender and see if we have an existing session */
+
+    if (!cevent_ciphertext || !sender_key) {
+        fprintf(stderr, "%s: no ciphertext or sender_key in olm event\n", __func__);
+        return;
+    }
+    JsonObject *our_ciphertext = matrix_json_object_get_object_member(cevent_ciphertext, conn->e2e->curve25519_pubkey);
+    if (!our_ciphertext) {
+        fprintf(stderr, "%s: No ciphertext with our curve25519 pubkey\n", __func__);
+        return;
+    }
+    JsonNode *type_node = matrix_json_object_get_member(our_ciphertext, "type");
+    if (!type_node) {
+        fprintf(stderr, "%s: No type node\n", __func__);
+        return;
+    }
+
+    gint64 type = matrix_json_node_get_int(type_node);
+    fprintf(stderr, "%s: Type %zd olm encrypted message from %s\n", __func__, (size_t)type, cevent_sender);
+    if (!type) {
+        /* A 'prekey' message to establish an Olm session */
+        /* TODO!!!!: Try existing sessions and check with matches_inbound_session */
+        OlmSession *session = olm_session(g_malloc0(olm_session_size()));
+        const gchar *cevent_body = matrix_json_object_get_string_member(our_ciphertext, "body");
+        gchar *cevent_body_copy = g_strdup(cevent_body);
+        if (olm_create_inbound_session_from(session, conn->e2e->oa, sender_key, strlen(sender_key),
+                                        cevent_body_copy, strlen(cevent_body)) == olm_error()) {
+            fprintf(stderr, "%s: olm prekey inbound_session_from failed with %s\n",
+                    __func__, olm_session_last_error(session));
+            return;
+        }
+        g_free(cevent_body_copy);
+        if (olm_remove_one_time_keys(conn->e2e->oa, session) == olm_error()) {
+            fprintf(stderr, "%s: Failed to remove 1tk from inbound session creation: %s\n",
+                    __func__, olm_account_last_error(conn->e2e->oa));
+            return;
+        }
+        cevent_body_copy = g_strdup(cevent_body);
+        size_t max_plaintext_len = olm_decrypt_max_plaintext_length(session, 0 /* Prekey */,
+                                       cevent_body_copy, strlen(cevent_body_copy));
+        if (max_plaintext_len == olm_error()) {
+            fprintf(stderr, "%s: Failed to get plaintext length %s\n",
+                    __func__, olm_session_last_error(session));
+            return;
+        }
+        g_free(cevent_body_copy);
+        gchar *plaintext = g_malloc0(max_plaintext_len + 1);
+        cevent_body_copy = g_strdup(cevent_body);
+
+        size_t pt_len = olm_decrypt(session, 0 /* Prekey */, cevent_body_copy, strlen(cevent_body),
+                        plaintext, max_plaintext_len);
+        if (pt_len == olm_error() || pt_len >= max_plaintext_len) {
+            fprintf(stderr, "%s: Failed to decrypt inbound session creation event: %s\n",
+                    __func__, olm_session_last_error(session));
+            return;
+        }
+        plaintext[pt_len] = '\0';
+        handle_decrypted_olm(pc, conn, cevent_sender, sender_key, plaintext);
+        g_free(plaintext);
+        // TODO: Store session in db
+    } else {
+        fprintf(stderr, "%s: Type %zd olm\n", __func__, type);
+    }
+    // TODO  resave account? Or just session?
+}
+
+/*
+ * See:
+ * https://matrix.org/docs/guides/e2e_implementation.html#handling-an-m-room-encrypted-event
+ * d2d: True if this is a device-to-device message
+ * TODO: We really need to build a queue of stuff to decrypt, especially since they take multiple
+ * messages to deal with when we have to fetch stuff/validate a device id
+ * TODO: All the error paths in this function need to clean up!
+ */
+void matrix_e2e_decrypt(PurpleConnection *pc, JsonObject *cevent, gboolean d2d)
+{
+    MatrixConnectionData *conn = purple_connection_get_protocol_data(pc);
+    const gchar *cevent_type = matrix_json_object_get_string_member(cevent, "type");
+    const gchar *cevent_sender = matrix_json_object_get_string_member(cevent, "sender");
+    fprintf(stderr, "%s: %s from %s\n", __func__, cevent_type, cevent_sender);
+
+    if (strcmp(cevent_type, "m.room.encrypted")) {
+        fprintf(stderr, "%s: %s unexpected type\n", __func__, cevent_type);
+        goto out;
+    }
+
+    JsonObject *cevent_content = matrix_json_object_get_object_member(cevent, "content");
+    const gchar *cevent_algo = matrix_json_object_get_string_member(cevent_content, "algorithm");
+    if (!cevent_algo) {
+        fprintf(stderr, "%s: Encrypted event doesn't have algorithm entry\n", __func__);
+        goto out;
+    }
+
+    if (!strcmp(cevent_algo, "m.olm.v1.curve25519-aes-sha2")) {
+        return decrypt_olm(pc, conn, cevent, cevent_content, d2d);
+    } else if (!strcmp(cevent_algo, "m.megolm.v1.aes-sha2")) {
+        fprintf(stderr, "%s: It's megolm!\n", __func__);
+        // TODO
+    } else {
+        fprintf(stderr, "%s: Unknown crypto algorithm %s\n", __func__, cevent_algo);
+    }
+
+out:
+    return;
+}
+

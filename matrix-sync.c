@@ -16,6 +16,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02111-1301 USA
  */
 
+#include <string.h>
 #include "matrix-sync.h"
 
 /* json-glib */
@@ -28,6 +29,7 @@
 
 /* libmatrix */
 #include "matrix-connection.h"
+#include "matrix-e2e.h"
 #include "matrix-event.h"
 #include "matrix-json.h"
 #include "matrix-room.h"
@@ -289,6 +291,24 @@ void matrix_sync_parse(PurpleConnection *pc, JsonNode *body,
             _handle_invite(room_id, room_data, pc);
         }
         g_list_free(room_ids);
+    }
+
+    JsonObject *to_device = matrix_json_object_get_object_member(rootObj, "to_device");
+    if (to_device) {
+        JsonArray *events = matrix_json_object_get_array_member(to_device, "events");
+        guint i = 0;
+        JsonNode *device_event;
+        while (device_event = matrix_json_array_get_element(events, i++), device_event) {
+            JsonObject *event_obj = matrix_json_node_get_object(device_event);
+            const gchar *event_type = matrix_json_object_get_string_member(event_obj, "type");
+            fprintf(stderr, "to_device: Got %s from %s\n",
+                    event_type,
+                    matrix_json_object_get_string_member(event_obj, "sender"));
+            if (!strcmp(event_type, "m.room.encrypted")) {
+                matrix_e2e_decrypt(pc, event_obj, TRUE);
+            } else {
+            }
+        }
     }
 
 }

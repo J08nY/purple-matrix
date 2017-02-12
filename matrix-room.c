@@ -208,6 +208,8 @@ static void _on_state_update(const gchar *event_type,
             strcmp(event_type, "m.room.canonical_alias") == 0 ||
             strcmp(event_type, "m.room.name") == 0) {
         _schedule_name_update(conv);
+    } else if (strcmp(event_type, "m.room.encryption") == 0) {
+        fprintf(stderr, "Got m.room.encryption!\n");
     }
     else if(strcmp(event_type, "m.room.topic") == 0) {
         _on_topic_change(conv, new_state);
@@ -815,6 +817,11 @@ void matrix_room_handle_timeline_event(PurpleConversation *conv,
 
     if(event_type == NULL) {
         purple_debug_warning("matrixprpl", "event missing type field");
+        return;
+    }
+
+    if(!strcmp(event_type, "m.room.encrypted")) {
+        fprintf(stderr, "Got an m.room.encrypted!\n");
         return;
     }
 
