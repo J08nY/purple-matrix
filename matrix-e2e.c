@@ -282,14 +282,50 @@ out:
     return ret;
 }
 
+/* Called back when we've successfully uploaded the device keys */
 static void key_upload_callback(MatrixConnectionData *conn,
                                 gpointer user_data,
                                 struct _JsonNode *json_root,
                                 const char *body,
                                 size_t body_len, const char *content_type)
 {
-  fprintf(stderr, "%s: %s\n", __func__, body);
-  // TODO
+    gboolean need_to_send = FALSE;
+    gboolean have_count = FALSE;
+    /* e2e guide says send more keys if we have less than half the max */
+    size_t max_keys = olm_account_max_number_of_one_time_keys(conn->e2e->oa);
+    size_t to_create = max_keys;
+    /* The server responds with a count of the one time keys on the server */
+    JsonObject *top_object = matrix_json_node_get_object(json_root);
+    JsonObject *key_counts = matrix_json_object_get_object_member(top_object, "one_time_key_counts");
+
+    fprintf(stderr, "%s: json_root=%p top_object=%p key_counts=%p\n", __func__, json_root, top_object, key_counts);
+
+    if (key_counts) {
+        JsonObjectIter iter;
+        const gchar *key_algo;
+        JsonNode *key_count_node;
+        json_object_iter_init(&iter, key_counts);
+        while (json_object_iter_next(&iter, &key_algo, &key_count_node)) {
+            gint64 count = matrix_json_node_get_int(key_count_node);
+            have_count = TRUE;
+            if (count < max_keys / 2) {
+                to_create = max_keys - count;
+                need_to_send = TRUE;
+            }
+            fprintf(stderr, "%s: %s: %ld\n", __func__, key_algo, count);
+        }
+    }
+
+    /* If there are no counts on the server assume we need to send some */
+    /* TODO: This could be more selective and check for counts of the ones
+     * we care about (perhaps we don't need to loop - just ask for those)
+     */
+    need_to_send |= !have_count;
+
+    if (need_to_send) {
+        // TODO
+        fprintf(stderr, "%s: need to send\n",__func__);
+    }
 }
 
 /*
@@ -400,7 +436,7 @@ int matrix_e2e_get_device_keys(MatrixConnectionData *conn, const gchar *device_i
     /* Send the keys */
     matrix_api_upload_keys(conn, json_dev_keys, NULL /* TODO: one time keys */,
         key_upload_callback,
-        matrix_api_error, matrix_api_bad_response, NULL);
+        matrix_api_error, matrix_api_bad_response, (void *)0);
 
     ret = 0;
 
