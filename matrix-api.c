@@ -215,6 +215,27 @@ static int _handle_body(http_parser *http_parser, const char *at,
                 (int)length, at);
 
     if(strcmp(response_data->content_type, "application/json") == 0) {
+        char *empty_string_key = strstr(at,"\"\":");
+        if (empty_string_key) {
+            /* Work around json glib bug 747279 - it doesn't like empty constant strings - rather unsafe hack - and not freeing and only coping with one
+            */
+            char *at2 = g_malloc(strlen(at)+2);
+            char *atptr;
+            size_t len = empty_string_key - at;
+            //fprintf(stderr, "Bad string: %s\n", at);
+            //fprintf(stderr, "Bad key: %s\n", empty_string_key);
+            memcpy(at2, at, len);
+            atptr = at2+len;
+            *(atptr++) = '"';
+            *(atptr++) = '!';
+            *(atptr++) = '"';
+            *(atptr++) = ':';
+            strcpy(atptr, empty_string_key+3);
+            //fprintf(stderr, "fixed string : %s\n", at2);
+            at=at2;
+            length++;
+        }
+        //fprintf(stderr, "%s: about to parse %s\n", __func__, at);
         if(!json_parser_load_from_data(response_data -> json_parser, at, length,
                 &err)) {
             purple_debug_info("matrixprpl", "unable to parse JSON: %s\n",
