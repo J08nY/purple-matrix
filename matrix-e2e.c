@@ -18,6 +18,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <sqlite3.h>
 #include "libmatrix.h"
 #include "matrix-api.h"
 #include "matrix-e2e.h"
@@ -35,6 +36,7 @@ struct _MatrixE2EData {
     gchar *device_id;
     gchar *curve25519_pubkey;
     gchar *ed25519_pubkey;
+    sqlite3 *db;
 };
 
 
@@ -448,6 +450,93 @@ static void key_upload_callback(MatrixConnectionData *conn,
     }
 }
 
+static void close_e2e_db(MatrixConnectionData *conn)
+{
+    sqlite3_close(conn->e2e->db);
+    conn->e2e->db = NULL;
+}
+
+/* 'check' and 'create' are SQL statements; call check, if it returns no result
+ * then run 'create'.
+ * typically for checking for the existence of a table and creating it if it didn't
+ * exist.
+ */
+static int ensure_table(MatrixConnectionData *conn, const char *check, const char *create)
+{
+    PurpleConnection *pc = conn->pc;
+    int ret;
+    sqlite3_stmt *dbstmt;
+    ret = sqlite3_prepare_v2(conn->e2e->db, check, -1, &dbstmt, NULL);
+    if (ret != SQLITE_OK || !dbstmt) {
+        fprintf(stderr, "Failed to prep db table query %d\n", ret);
+        purple_connection_error_reason(pc,
+            PURPLE_CONNECTION_ERROR_OTHER_ERROR,
+            "Failed to check e2e db table list (prep)");
+        return -1;
+    }
+    ret = sqlite3_step(dbstmt);
+    sqlite3_finalize(dbstmt);
+    fprintf(stderr, "db table query %d\n", ret);
+    if (ret == SQLITE_ROW) {
+        return 0;
+    }
+    ret = sqlite3_prepare_v2(conn->e2e->db, create, -1, &dbstmt, NULL);
+    if (ret != SQLITE_OK || !dbstmt) {
+        fprintf(stderr, "Failed to prep db table creaton %d\n", ret);
+        purple_connection_error_reason(pc,
+            PURPLE_CONNECTION_ERROR_OTHER_ERROR,
+            "Failed to create e2e db table (prep)");
+        return -1;
+    }
+    ret = sqlite3_step(dbstmt);
+    sqlite3_finalize(dbstmt);
+    if (ret != SQLITE_DONE) {
+        fprintf(stderr, "db table creation failed %d\n", ret);
+        purple_connection_error_reason(pc,
+            PURPLE_CONNECTION_ERROR_OTHER_ERROR,
+            "Failed to create e2e db table (step)");
+        return -1;
+    }
+
+    return 0;
+}
+static int open_e2e_db(MatrixConnectionData *conn)
+{
+    PurpleConnection *pc = conn->pc;
+    int ret;
+    const char *purple_username = 
+                    purple_account_get_username(purple_connection_get_account(pc));
+    char *cfilename = g_malloc(strlen(conn->user_id) + strlen(purple_username) +
+                               1 + 16);
+    sprintf(cfilename, "matrix-%s-%s.db", conn->user_id, purple_username);
+    const char *escaped_filename = purple_escape_filename(cfilename);
+    g_free(cfilename);
+    char *full_path = g_malloc(strlen(purple_user_dir())+strlen(escaped_filename)+4);
+    sprintf(full_path, "%s/%s", purple_user_dir(), escaped_filename);
+    ret = sqlite3_open(full_path, &conn->e2e->db);
+    fprintf(stderr, "Opened e2e db at %s got %d\n", full_path, ret);
+    g_free(full_path);
+    if (ret) {
+        purple_connection_error_reason(pc,
+            PURPLE_CONNECTION_ERROR_OTHER_ERROR,
+            "Failed to open e2e db");
+        return ret;
+    }
+
+    ret = ensure_table(conn,
+                 "SELECT name FROM sqlite_master WHERE type='table' AND name='olmsessions'",
+                 "CREATE TABLE olmsessions (sender_name text, sender_key text,"
+                 "                          session_pickle text, last_seen text,"
+                 "                          PRIMARY KEY (sender_name, sender_key))");
+
+    if (ret) {
+        close_e2e_db(conn);
+        return ret;
+    }
+
+    return 0;
+}
+
 /*
  * Get a set of device keys for ourselves.  Either by retreiving it from our store
  * or by generating a new set.
@@ -501,6 +590,12 @@ int matrix_e2e_get_device_keys(MatrixConnectionData *conn, const gchar *device_i
         if (ret) {
             goto out;
         }
+    }
+
+    /* Open the e2e db - an sqlite db held for the account */
+    ret = open_e2e_db(conn);
+    if (ret) {
+        goto out;
     }
 
     /* Form a device keys object for an upload,
@@ -568,6 +663,7 @@ out:
     g_free(pickled_account);
 
     if (ret) {
+        close_e2e_db(conn);
         g_free(conn->e2e->oa);
         g_free(conn->e2e->device_id);
         g_free(conn->e2e);
