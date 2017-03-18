@@ -671,10 +671,23 @@ out:
     return ret;
 }
 
+/* See: https://matrix.org/docs/guides/e2e_implementation.html#handling-an-m-room-key-event
+ */
 static int handle_m_room_key(PurpleConnection *pc, MatrixConnectionData *conn, JsonObject *mrk)
 {
+    int ret = 0;
     fprintf(stderr, "%s\n", __func__);
-    return 0;
+    JsonObject *mrk_content = matrix_json_object_get_object_member(mrk, "content");
+    const gchar *mrk_algo = matrix_json_object_get_string_member(mrk_conent, "algorithm");
+
+    if (!mrk_algo || strcmp(mrk_algo, "m.megolm.v1.aes-sha2")) {
+        fprintf(stderr, "%s: Not megolm (%s)\n", __func__, mrk_algo);
+        ret = -1;
+        goto out;
+    }
+
+out:
+    return ret;
 }
 
 /* Called from decypt_olm after we've decrypted an olm message.
