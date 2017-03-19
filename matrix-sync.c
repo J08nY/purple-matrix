@@ -293,6 +293,7 @@ void matrix_sync_parse(PurpleConnection *pc, JsonNode *body,
         g_list_free(room_ids);
     }
 
+    // TODO: Do this before syncing the rooms (but after join?)
     JsonObject *to_device = matrix_json_object_get_object_member(rootObj, "to_device");
     if (to_device) {
         JsonArray *events = matrix_json_object_get_array_member(to_device, "events");
@@ -305,7 +306,7 @@ void matrix_sync_parse(PurpleConnection *pc, JsonNode *body,
                     event_type,
                     matrix_json_object_get_string_member(event_obj, "sender"));
             if (!strcmp(event_type, "m.room.encrypted")) {
-                matrix_e2e_decrypt(pc, event_obj, TRUE);
+                matrix_e2e_decrypt_d2d(pc, event_obj);
             } else {
             }
         }

@@ -28,6 +28,7 @@
 
 #include "libmatrix.h"
 #include "matrix-api.h"
+#include "matrix-e2e.h"
 #include "matrix-event.h"
 #include "matrix-json.h"
 #include "matrix-roommembers.h"
@@ -822,6 +823,7 @@ void matrix_room_handle_timeline_event(PurpleConversation *conv,
 
     if(!strcmp(event_type, "m.room.encrypted")) {
         fprintf(stderr, "Got an m.room.encrypted!\n");
+        matrix_e2e_decrypt_room(conv, json_event_obj);
         return;
     }
 

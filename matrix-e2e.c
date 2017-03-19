@@ -39,6 +39,94 @@ struct _MatrixE2EData {
     sqlite3 *db;
 };
 
+#define PURPLE_CONV_E2E_STATE "e2e"
+
+/* Hung off the Purple conversation with the PURPLE_CONV_E2E_STATE */
+typedef struct _MatrixE2ERoomData {
+    /* Mapping from _MatrixHashKeyInBoundMegOlm to OlmInboundGroupSession */
+    GHashTable *megolm_sessions_inbound;
+} MatrixE2ERoomData;
+
+typedef struct _MatrixHashKeyInBoundMegOlm {
+    gchar *sender_key;
+    gchar *sender_id;
+    gchar *session_id;
+    gchar *device_id;
+} MatrixHashKeyInBoundMegOlm;
+
+/* GEqualFunc for two MatrixHashKeyInBoundMegOlm */
+static gboolean megolm_inbound_equality(gconstpointer a, gconstpointer b)
+{
+    const MatrixHashKeyInBoundMegOlm *hk_a = (const MatrixHashKeyInBoundMegOlm *)a;
+    const MatrixHashKeyInBoundMegOlm *hk_b = (const MatrixHashKeyInBoundMegOlm *)b;
+
+    return !strcmp(hk_a->sender_key, hk_b->sender_key) &&
+           !strcmp(hk_a->sender_id, hk_b->sender_id) &&
+           !strcmp(hk_a->session_id, hk_b->session_id) &&
+           !strcmp(hk_a->device_id, hk_b->device_id);
+}
+
+/* GHashFunc for a _MatrixHashKeyInBoundMegOlm */
+static guint megolm_inbound_hash(gconstpointer a)
+{
+    const MatrixHashKeyInBoundMegOlm *hk = (const MatrixHashKeyInBoundMegOlm *)a;
+    return g_str_hash(hk->sender_key) +
+           g_str_hash(hk->session_id) +
+           g_str_hash(hk->sender_id) +
+           g_str_hash(hk->device_id);
+}
+
+static MatrixE2ERoomData *get_e2e_room_data(PurpleConversation *conv)
+{
+    MatrixE2ERoomData *result;
+
+    result = purple_conversation_get_data(conv, PURPLE_CONV_E2E_STATE);
+    if (!result) {
+        // TODO: Who frees this?
+        result = g_new0(MatrixE2ERoomData, 1);
+        purple_conversation_set_data(conv, PURPLE_CONV_E2E_STATE, result);
+    }
+
+    return result;
+}
+
+static GHashTable *get_e2e_inbound_megolm_hash(PurpleConversation *conv)
+{
+    MatrixE2ERoomData *rd = get_e2e_room_data(conv);
+
+    if (!rd->megolm_sessions_inbound) {
+        // TODO: Maybe we want g_hash_table_new_full with the deallocators
+        rd->megolm_sessions_inbound = g_hash_table_new(megolm_inbound_hash,
+                                                       megolm_inbound_equality);
+    }
+
+    return rd->megolm_sessions_inbound;
+}
+
+static OlmInboundGroupSession *get_inbound_megolm_session(PurpleConversation *conv,
+        const gchar *sender_key, const gchar *sender_id, const gchar *session_id, const gchar *device_id) {
+    MatrixHashKeyInBoundMegOlm match;
+    match.sender_key = (gchar *)sender_key;
+    match.sender_id = (gchar *)sender_id;
+    match.session_id = (gchar *)session_id;
+    match.device_id = (gchar *)device_id;
+
+    OlmInboundGroupSession *result = (OlmInboundGroupSession *)g_hash_table_lookup(get_e2e_inbound_megolm_hash(conv), &match);
+    fprintf(stderr, "%s: %s/%s/%s/%s: %p\n", __func__, device_id, sender_id, sender_key, session_id, result);
+    return result;
+}
+
+static void store_inbound_megolm_session(PurpleConversation *conv,
+        const gchar *sender_key, const gchar *sender_id, const gchar *session_id, const gchar *device_id,
+        OlmInboundGroupSession *igs) {
+    MatrixHashKeyInBoundMegOlm *key = g_new0(MatrixHashKeyInBoundMegOlm, 1);
+    key->sender_key = g_strdup(sender_key);
+    key->sender_id = g_strdup(sender_id);
+    key->session_id = g_strdup(session_id);
+    key->device_id = g_strdup(device_id);
+    fprintf(stderr, "%s: %s/%s/%s/%s\n", __func__, device_id, sender_id, sender_key, session_id);
+    g_hash_table_insert(get_e2e_inbound_megolm_hash(conv), key, igs);
+}
 
 static void key_upload_callback(MatrixConnectionData *conn,
                                 gpointer user_data,
@@ -673,12 +761,15 @@ out:
 
 /* See: https://matrix.org/docs/guides/e2e_implementation.html#handling-an-m-room-key-event
  */
-static int handle_m_room_key(PurpleConnection *pc, MatrixConnectionData *conn, JsonObject *mrk)
+static int handle_m_room_key(PurpleConnection *pc, MatrixConnectionData *conn,
+                             const gchar *sender, const gchar *sender_key, const gchar *sender_device,
+                             JsonObject *mrk)
 {
     int ret = 0;
     fprintf(stderr, "%s\n", __func__);
     JsonObject *mrk_content = matrix_json_object_get_object_member(mrk, "content");
-    const gchar *mrk_algo = matrix_json_object_get_string_member(mrk_conent, "algorithm");
+    const gchar *mrk_algo = matrix_json_object_get_string_member(mrk_content, "algorithm");
+    OlmInboundGroupSession *in_mo_session = NULL;
 
     if (!mrk_algo || strcmp(mrk_algo, "m.megolm.v1.aes-sha2")) {
         fprintf(stderr, "%s: Not megolm (%s)\n", __func__, mrk_algo);
@@ -686,7 +777,42 @@ static int handle_m_room_key(PurpleConnection *pc, MatrixConnectionData *conn, J
         goto out;
     }
 
+    const gchar *mrk_room_id = matrix_json_object_get_string_member(mrk_content, "room_id");
+    const gchar *mrk_session_id = matrix_json_object_get_string_member(mrk_content, "session_id");
+    const gchar *mrk_session_key = matrix_json_object_get_string_member(mrk_content, "session_key");
+
+    /* Hmm at what point should something be in matrix_room.c? */
+    PurpleConversation *conv = purple_find_conversation_with_account(PURPLE_CONV_TYPE_CHAT, mrk_room_id, pc->account);
+    if (!conv) {
+        fprintf(stderr, "%s: Unknown room %s\n", __func__, mrk_room_id);
+        ret = -1;
+        goto out;
+    }
+
+    /* Search for an existing session with the matching room_id, sender_key, session_id */
+    in_mo_session = get_inbound_megolm_session(conv, sender_key, sender, mrk_session_id, sender_device);
+      
+    if (!in_mo_session) {
+        /* Bah, no match, lets make one */
+        in_mo_session =  olm_inbound_group_session(g_malloc(olm_inbound_group_session_size()));
+        if (olm_init_inbound_group_session(in_mo_session, (const uint8_t *)mrk_session_key, strlen(mrk_session_key)) == olm_error()) {
+            fprintf(stderr, "%s: megolm inbound session creation failed: %s\n", __func__, olm_inbound_group_session_last_error(in_mo_session));
+            ret = -1;
+            goto out;
+        }
+
+        store_inbound_megolm_session(conv, sender_key, sender, mrk_session_id, sender_device, in_mo_session);
+    }
+
+    // TODO: Store it in a db?
+    // TODO: What's the 'chain_index' member?
 out:
+    if (ret) {
+        if (in_mo_session) {
+            olm_clear_inbound_group_session(in_mo_session);
+        }
+        g_free(in_mo_session);
+    }
     return ret;
 }
 
@@ -746,7 +872,7 @@ static int handle_decrypted_olm(PurpleConnection *pc, MatrixConnectionData *conn
 
     /* TODO: check the device against the keys in use, stash somewhere? */
     if (!strcmp(pt_type, "m.room_key")) {
-        ret = handle_m_room_key(pc, conn, pt_body);
+        ret = handle_m_room_key(pc, conn, pt_sender, sender_key, pt_sender_device, pt_body);
     } else {
         fprintf(stderr, "%s: Got '%s' from '%s'/'%s'\n", __func__, pt_type, pt_sender_device, pt_sender);
     }
@@ -761,9 +887,8 @@ out:
  * TODO: All the error paths in this function need to clean up!
  */
 static void decrypt_olm(PurpleConnection *pc, MatrixConnectionData *conn, JsonObject *cevent,
-                                   JsonObject *cevent_content, gboolean d2d)
+                                   JsonObject *cevent_content)
 {
-    fprintf(stderr, "%s: It's olm!\n", __func__);
     const gchar *cevent_sender = matrix_json_object_get_string_member(cevent, "sender");
 
     const gchar *sender_key = matrix_json_object_get_string_member(cevent_content, "sender_key");
@@ -838,12 +963,12 @@ static void decrypt_olm(PurpleConnection *pc, MatrixConnectionData *conn, JsonOb
 /*
  * See:
  * https://matrix.org/docs/guides/e2e_implementation.html#handling-an-m-room-encrypted-event
- * d2d: True if this is a device-to-device message
+ * For decrypting d2d messages
  * TODO: We really need to build a queue of stuff to decrypt, especially since they take multiple
  * messages to deal with when we have to fetch stuff/validate a device id
  * TODO: All the error paths in this function need to clean up!
  */
-void matrix_e2e_decrypt(PurpleConnection *pc, JsonObject *cevent, gboolean d2d)
+void matrix_e2e_decrypt_d2d(PurpleConnection *pc, JsonObject *cevent)
 {
     MatrixConnectionData *conn = purple_connection_get_protocol_data(pc);
     const gchar *cevent_type = matrix_json_object_get_string_member(cevent, "type");
@@ -863,10 +988,9 @@ void matrix_e2e_decrypt(PurpleConnection *pc, JsonObject *cevent, gboolean d2d)
     }
 
     if (!strcmp(cevent_algo, "m.olm.v1.curve25519-aes-sha2")) {
-        return decrypt_olm(pc, conn, cevent, cevent_content, d2d);
+        return decrypt_olm(pc, conn, cevent, cevent_content);
     } else if (!strcmp(cevent_algo, "m.megolm.v1.aes-sha2")) {
-        fprintf(stderr, "%s: It's megolm!\n", __func__);
-        // TODO
+        fprintf(stderr, "%s: It's megolm - unexpected for d2d!\n", __func__);
     } else {
         fprintf(stderr, "%s: Unknown crypto algorithm %s\n", __func__, cevent_algo);
     }
@@ -874,4 +998,87 @@ void matrix_e2e_decrypt(PurpleConnection *pc, JsonObject *cevent, gboolean d2d)
 out:
     return;
 }
+
+
+void matrix_e2e_decrypt_room(PurpleConversation *conv, struct _JsonObject *cevent)
+{
+    {
+       JsonNode *tmp_top = json_node_new(JSON_NODE_OBJECT);
+       json_node_set_object(tmp_top, cevent);
+       JsonGenerator *generator = json_generator_new();
+       json_generator_set_pretty(generator, TRUE);
+       json_generator_set_root(generator, tmp_top);
+       const char *json = json_generator_to_data(generator, NULL);
+       fprintf(stderr, "%s: %s\n", json, __func__);
+
+    }
+
+    const gchar *cevent_sender = matrix_json_object_get_string_member(cevent, "sender");
+    JsonObject *cevent_content = matrix_json_object_get_object_member(cevent, "content");
+    const gchar *cevent_sender_key = matrix_json_object_get_string_member(cevent_content, "sender_key");
+    const gchar *cevent_session_id = matrix_json_object_get_string_member(cevent_content, "session_id");
+    const gchar *cevent_device_id = matrix_json_object_get_string_member(cevent_content, "device_id");
+    const gchar *algorithm = matrix_json_object_get_string_member(cevent_content, "algorithm");
+    const gchar *cevent_ciphertext = matrix_json_object_get_string_member(cevent_content, "ciphertext");
+
+    if (!algorithm || strcmp(algorithm, "m.megolm.v1.aes-sha2")) {
+        fprintf(stderr, "%s: Bad algorithm %s\n", __func__, algorithm);
+        return;
+    }
+
+    if (!cevent_sender || !cevent_content || !cevent_sender_key || !cevent_session_id || !cevent_device_id || !cevent_ciphertext) {
+        fprintf(stderr, "%s: Missing field sender: %s content: %p sender_key: %s session_id: %s device_id: %s ciphertext: %s\n",
+                __func__, cevent_sender, cevent_content, cevent_sender_key, cevent_session_id, cevent_device_id, cevent_ciphertext);
+        return;
+    }
+
+    OlmInboundGroupSession *oigs = get_inbound_megolm_session(conv, cevent_sender_key,
+                                                              cevent_sender, cevent_session_id,
+                                                              cevent_device_id);
+    if (!oigs) {
+        // TODO: Queue this message and decrypt it when we get the session?
+        // TODO: Check device verification state?
+        fprintf(stderr, "%s: No Megolm session for %s/%s/%s/%s\n", __func__,
+                cevent_device_id, cevent_sender, cevent_sender_key, cevent_session_id);
+        return;
+    }
+    fprintf(stderr, "%s: have Megolm session %p for %s/%s/%s/%s\n",
+            __func__, oigs, cevent_device_id, cevent_sender, cevent_sender_key, cevent_session_id);
+    gchar *dupe_ciphertext = g_strdup(cevent_ciphertext);
+    size_t maxlen = olm_group_decrypt_max_plaintext_length(oigs, (uint8_t *)dupe_ciphertext, strlen(dupe_ciphertext));
+    if (maxlen == olm_error()) {
+        fprintf(stderr, "%s: olm_group_decrypt_max_plaintext_length says %s for %s/%s/%s/%s\n",
+                __func__, olm_inbound_group_session_last_error(oigs),
+                cevent_device_id, cevent_sender, cevent_sender_key, cevent_session_id);
+        g_free(dupe_ciphertext);
+        return;
+    }
+    g_free(dupe_ciphertext);
+    dupe_ciphertext = g_strdup(cevent_ciphertext);
+    gchar *plaintext = g_malloc0(maxlen+1);
+    uint32_t index;
+    size_t decrypt_len = olm_group_decrypt(oigs, (uint8_t *)dupe_ciphertext, strlen(dupe_ciphertext),
+                                           (uint8_t *)plaintext, maxlen, &index);
+    if (decrypt_len == olm_error()) {
+        fprintf(stderr, "%s: olm_group_decrypt says %s for %s/%s/%s/%s\n",
+                __func__, olm_inbound_group_session_last_error(oigs),
+                cevent_device_id, cevent_sender, cevent_sender_key, cevent_session_id);
+        g_free(dupe_ciphertext);
+        g_free(plaintext);
+        return;
+    }
+
+    if (decrypt_len > maxlen) {
+        fprintf(stderr, "%s: olm_group_decrypt len=%zd max was supposed to be %zd\n", __func__, decrypt_len, maxlen);
+        g_free(dupe_ciphertext);
+        g_free(plaintext);
+        return;
+    }
+    plaintext[decrypt_len] = '\0';
+    fprintf(stderr, "%s: Decrypted megolm event as '%s' index=%zd\n", __func__, plaintext, (size_t)index);
+    // TODO: Stash index somewhere - supposed to check it for validity
+    // TODO: JSON parse it and then send it back to matrix_room_handle_timeline_event
+    g_free(plaintext);
+}
+
 
