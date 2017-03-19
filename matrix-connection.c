@@ -168,6 +168,7 @@ static void _login_completed(MatrixConnectionData *conn,
     JsonObject *root_obj;
     const gchar *access_token;
     const gchar *next_batch;
+    const gchar *device_id;
     gboolean needs_full_state_sync = TRUE;
 
     root_obj = matrix_json_node_get_object(json_root);
@@ -182,8 +183,8 @@ static void _login_completed(MatrixConnectionData *conn,
     conn->access_token = g_strdup(access_token);
     conn->user_id = g_strdup(matrix_json_object_get_string_member(root_obj,
             "user_id"));
-    purple_account_set_string(pc->account, "device_id", 
-        matrix_json_object_get_string_member(root_obj, "device_id"));
+    device_id = matrix_json_object_get_string_member(root_obj, "device_id");
+    purple_account_set_string(pc->account, "device_id", device_id);
 
     if (device_id) {
         matrix_e2e_get_device_keys(conn, device_id);
