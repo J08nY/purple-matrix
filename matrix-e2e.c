@@ -999,20 +999,12 @@ out:
     return;
 }
 
-
-void matrix_e2e_decrypt_room(PurpleConversation *conv, struct _JsonObject *cevent)
+/*
+ * If succesful returns a JsonParser on the decrypted event.
+ */
+JsonParser *matrix_e2e_decrypt_room(PurpleConversation *conv, struct _JsonObject *cevent)
 {
-    {
-       JsonNode *tmp_top = json_node_new(JSON_NODE_OBJECT);
-       json_node_set_object(tmp_top, cevent);
-       JsonGenerator *generator = json_generator_new();
-       json_generator_set_pretty(generator, TRUE);
-       json_generator_set_root(generator, tmp_top);
-       const char *json = json_generator_to_data(generator, NULL);
-       fprintf(stderr, "%s: %s\n", json, __func__);
-
-    }
-
+    JsonParser *plaintext_parser;
     const gchar *cevent_sender = matrix_json_object_get_string_member(cevent, "sender");
     JsonObject *cevent_content = matrix_json_object_get_object_member(cevent, "content");
     const gchar *cevent_sender_key = matrix_json_object_get_string_member(cevent_content, "sender_key");
@@ -1023,13 +1015,13 @@ void matrix_e2e_decrypt_room(PurpleConversation *conv, struct _JsonObject *ceven
 
     if (!algorithm || strcmp(algorithm, "m.megolm.v1.aes-sha2")) {
         fprintf(stderr, "%s: Bad algorithm %s\n", __func__, algorithm);
-        return;
+       return NULL;
     }
 
     if (!cevent_sender || !cevent_content || !cevent_sender_key || !cevent_session_id || !cevent_device_id || !cevent_ciphertext) {
         fprintf(stderr, "%s: Missing field sender: %s content: %p sender_key: %s session_id: %s device_id: %s ciphertext: %s\n",
                 __func__, cevent_sender, cevent_content, cevent_sender_key, cevent_session_id, cevent_device_id, cevent_ciphertext);
-        return;
+        return NULL;
     }
 
     OlmInboundGroupSession *oigs = get_inbound_megolm_session(conv, cevent_sender_key,
@@ -1040,7 +1032,7 @@ void matrix_e2e_decrypt_room(PurpleConversation *conv, struct _JsonObject *ceven
         // TODO: Check device verification state?
         fprintf(stderr, "%s: No Megolm session for %s/%s/%s/%s\n", __func__,
                 cevent_device_id, cevent_sender, cevent_sender_key, cevent_session_id);
-        return;
+        return NULL;
     }
     fprintf(stderr, "%s: have Megolm session %p for %s/%s/%s/%s\n",
             __func__, oigs, cevent_device_id, cevent_sender, cevent_sender_key, cevent_session_id);
@@ -1051,7 +1043,7 @@ void matrix_e2e_decrypt_room(PurpleConversation *conv, struct _JsonObject *ceven
                 __func__, olm_inbound_group_session_last_error(oigs),
                 cevent_device_id, cevent_sender, cevent_sender_key, cevent_session_id);
         g_free(dupe_ciphertext);
-        return;
+        return NULL;
     }
     g_free(dupe_ciphertext);
     dupe_ciphertext = g_strdup(cevent_ciphertext);
@@ -1065,20 +1057,33 @@ void matrix_e2e_decrypt_room(PurpleConversation *conv, struct _JsonObject *ceven
                 cevent_device_id, cevent_sender, cevent_sender_key, cevent_session_id);
         g_free(dupe_ciphertext);
         g_free(plaintext);
-        return;
+        return NULL;
     }
 
     if (decrypt_len > maxlen) {
         fprintf(stderr, "%s: olm_group_decrypt len=%zd max was supposed to be %zd\n", __func__, decrypt_len, maxlen);
         g_free(dupe_ciphertext);
         g_free(plaintext);
-        return;
+        return NULL;
     }
+    // TODO: Stash index somewhere - supposed to check it for validity
     plaintext[decrypt_len] = '\0';
     fprintf(stderr, "%s: Decrypted megolm event as '%s' index=%zd\n", __func__, plaintext, (size_t)index);
-    // TODO: Stash index somewhere - supposed to check it for validity
-    // TODO: JSON parse it and then send it back to matrix_room_handle_timeline_event
+    g_free(dupe_ciphertext);
+    plaintext_parser = json_parser_new();
+    GError *err = NULL;
+    if (!json_parser_load_from_data(plaintext_parser,
+                                    plaintext, strlen(plaintext), &err)) {
+        fprintf(stderr, "%s: Failed to json parse decrypted plain text: %s\n", __func__, plaintext);
+        g_free(plaintext);
+        g_error_free(err);
+        g_object_unref(plaintext_parser);
+    }
+    //    Check the room_id matches this conversation
+    //
     g_free(plaintext);
+
+    return plaintext_parser;
 }
 
 
